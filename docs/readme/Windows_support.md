@@ -34,9 +34,11 @@ pub trait MountPoint {
 
 A Windows backend must implement this same trait behind a `#[cfg(target_os = "windows")]`
 gate, mirroring how `linux.rs` is gated with `#[cfg(target_os = "linux")]` in
-`src/mount.rs`. **No change to the encryption layer is required** — `EncryptedFs`
-(`src/encryptedfs.rs`) is entirely backend-agnostic and exposes all the operations a
-mount driver needs. The Windows work is confined to a new `src/mount/windows.rs`.
+`src/mount.rs`. The trait boundary itself is clean: `EncryptedFs`
+(`src/encryptedfs.rs`) is backend-agnostic and exposes all the operations a
+mount driver needs, and the mount-side work is confined to a new `src/mount/windows.rs`.
+One real exception exists, though, and must be settled before coding: the ciphertext
+names `EncryptedFs` writes into the data dir contain `|`, which NTFS forbids — see §7.
 
 **First-milestone scope (must be truthful):**
 
@@ -58,8 +60,8 @@ write, read directory, etc.), plus an event-loop `FileSystemHost`.
 - **Pros:** Mature, documented, actively used; maps 1:1 onto WinFsp's model; async
   bridging is handled by the crate's own runtime integration; many examples (memfs,
   passthrough) to crib from.
-- **Cons:** The `winfsp` crate is **GPL-3.0** licensed (see §3 licensing). It pulls in a
-  large dependency tree.
+- **Cons:** The `winfsp` crate is **GPL-3.0** licensed (see §3 licensing for the
+  verified metadata trail). It pulls in a large dependency tree.
 
 ### 2.2 Alternative: `unifuse` (MIT, cross-platform)
 
@@ -83,6 +85,18 @@ since WinFsp is natively path-based).
 - **Direct WinFsp C API via `windows`/`windows-sys`** — maximum control but the most
   code to hand-write; not worth it until the binding crates prove inadequate.
 
+### 2.4 Other Windows mount mechanisms — evaluated, rejected
+
+Recorded here so the WinFsp choice is a decision someone can re-open with full
+information, not an assumption:
+
+| Mechanism | What it is | Why it is not the right backend for rencfs |
+|---|---|---|
+| **Dokany** | User-mode filesystem library for Windows (dokany2). Its user-mode library and driver are **LGPL-3.0**, samples MIT (per the repo's `license.lgpl.txt` / `license.mit.txt` and README licensing section). | LGPL is a softer boundary than GPL-3 but still a license review, and the Rust ecosystem around Dokany is smaller and less maintained than around WinFsp; Dokany's callback model is FUSE-shaped, which fits rencfs's existing Linux code less cleanly than WinFsp's native NT-style semantics. |
+| **ProjFS** (Windows Projection File System) | Microsoft's placeholder/projection API for cloud files. | Projection semantics: the provider materializes placeholders; it is designed for sync providers, not for a transparent, always-live encrypted mount (create/rename/write paths are awkward to map onto an `EncryptedFs` inode store). |
+| **Cloud Files API** (`cldapi`) | The sync-engine framework OneDrive-style providers build on. | Same shape problem: it models a local-cache + sync-engine, which would force rencfs to pretend to be a sync client. rencfs is a live passthrough crypto layer; there is no remote to sync. |
+| **WSL passthrough** | Exposing Linux mounts to Windows via WSL. | Not a Windows-native mount: visibility/perf/semantics for regular Win32 apps (Explorer, antivirus, installers) depend on the WSL9P broker, and it requires WSL to be installed and running. It hides the problem, it does not implement the backend. |
+
 **Decision:** implement the first milestone with **`winfsp-rs`**, because it is the
 closest match to the existing inode-based design and has the richest examples. Keep
 `unifuse` as the fallback if the GPL-3 license boundary becomes a blocker (§3).
@@ -97,8 +111,23 @@ code, because it determines which crate we may link.
 | Component | License | Impact on rencfs (MIT OR Apache-2.0) |
 |---|---|---|
 | **WinFsp** (C++ runtime) | **GPLv3 + FLOSS special exception** | ✅ Usable. The FLOSS exception explicitly permits use by free/open-source software. rencfs is FLOSS, so no GPL contagion from WinFsp itself. |
-| **`winfsp` (winfsp-rs) crate** | **GPL-3.0** | ⚠️ GPL is contagious. Linking it makes the *Windows build* GPL-3. For an `MIT OR Apache-2.0` project this is a license-boundary decision the maintainers must accept or avoid. |
+| **`winfsp` (winfsp-rs) crate** | **GPL-3.0** (verified, see below) | ⚠️ GPL is contagious. Linking it makes the *Windows build* GPL-3. For an `MIT OR Apache-2.0` project this is a license-boundary decision the maintainers must accept or avoid. |
 | **`unifuse` crate** | **MIT** | ✅ No contagion. |
+
+**License verification trail for the `winfsp` crate** (checked 2026-10-27, because
+"what license is the crate actually under" has circulated with conflicting answers):
+
+- crates.io **version metadata** for every current release — `0.13.2+winfsp-2.1`
+  (published 2026-10-20), `0.13.1`, `0.13.0`, `0.12.6` — declares `GPL-3.0`.
+- The crates.io **crate-level** `license` field is `null` even though every version
+  declares GPL-3.0 — the crate-level field is legacy metadata and must not be read as
+  "no license declared"; the authoritative sources are the version metadata and the
+  repository `LICENSE`.
+- The source repository (`SnowflakePowered/winfsp-rs`) reports **GPL-3.0** via the
+  GitHub license API.
+
+So: the crate is GPL-3.0 on all three evidence layers; treat any "license: None" claim
+as a metadata-reading artifact, and still read the repo `LICENSE` before shipping.
 
 Two viable paths:
 
@@ -204,7 +233,9 @@ The full set of `EncryptedFs` methods available for the mapping (from
 - **Names are encrypted** (the encrypted filesystem stores ciphertext filenames). The
   `EncryptedFs` layer handles name encryption/decryption internally; the mount layer must
   pass *plaintext* names to/from the OS and let `EncryptedFs` translate. Do **not**
-  re-encrypt in the Windows module.
+  re-encrypt in the Windows module. (The Win32-legality problem with the *ciphertext*
+  alphabet — `|` — is a data-dir/on-disk-format issue, not a mount-boundary issue; see
+  §7 and §11 Q5.)
 - **Inodes:** `EncryptedFs` uses `u64` inodes internally. WinFsp is path-based, so the
   Windows module needs a path↔inode translation layer (like the one inside `linux.rs`).
   Maintain a `HashMap<PathBuf, u64>` or resolve via `find_by_name` walking from the root.
@@ -260,12 +291,69 @@ The full set of `EncryptedFs` methods available for the mapping (from
 - **POSIX permissions ↔ Windows ACLs** — the Linux backend uses mode bits
   (`allow_root`/`allow_other`). On Windows, map these to a coarse ACL (e.g. owner full
   control, others read-only) rather than attempting full POSIX→NTFS ACL translation.
-- **Case sensitivity** — decide and document whether encrypted names are case-sensitive
-  (they should be, matching the Linux backend); WinFsp defaults to case-insensitive
-  unless configured. This must be a deliberate, documented choice.
+- **Case sensitivity** — the encrypted store is case-sensitive (two ciphertext names
+  differing only in case are distinct entries), and Windows must be told so explicitly:
+  `FSP_FSCTL_VOLUME_PARAMS` carries a `CaseSensitiveSearch:1` bit (see
+  `inc/winfsp/fsctl.h` in the WinFsp repo) that maps to
+  `FILE_CASE_SENSITIVE_SEARCH`. If the flag is left off, callers may treat `Foo.txt` and
+  `foo.txt` as the same file before the request ever reaches our callbacks, collapsing
+  two distinct encrypted entries into one visible file — silent data loss, not a cosmetic
+  issue. Recommended: set `CaseSensitiveSearch = TRUE` to match the Linux backend, and
+  document in the README that installers/legacy software which assume case-insensitive
+  lookups may misbehave on this mount, rather than papering over it with a name-folding
+  workaround. This must still be a deliberate, documented choice.
+- **On-disk ciphertext names use a Windows-illegal character (verified against the
+  code — this is the deepest Windows issue in rencfs).** `encrypt_file_name`
+  (`src/crypto.rs`) encodes names with `base64(STANDARD)` (NO_PAD) and rewrites `/` to
+  `|` so the name is safe as a *Linux* filename. But `|` is in the forbidden Win32 set
+  (`<>:"/\|?*`) — so when the **data dir itself** lives on NTFS, `EncryptedFs` cannot
+  even create its own backing files for every entry. This is not something
+  `windows.rs` can escape at the mount boundary; it reaches the on-disk format.
+  Options, in rough order of cleanliness:
+  1. **Change the rewrite target**, or move to **base64url**: the current scheme's
+     `/`→`|` choice was only ever constrained by "legal on Linux"; `/`→`-` (or full
+     base64url `-`/`_`) is legal on Linux *and* Windows and keeps the same
+     unambiguity property (`-` never appears in the STANDARD alphabet) — one format
+     everywhere. Breaking for existing Linux stores (whose files are already spelled
+     with `|`) unless `find_by_name` grows a dual-alphabet fallback (cheap: try the
+     new spelling, then the legacy one).
+  2. **Target-aware alphabet** (STANDARD+`|` on Linux, URL-safe on Windows) with a
+     decoder that accepts both — avoids breaking existing dirs but forks the format
+     per platform, which bites whenever a USB/backup data dir crosses OSes.
+  3. Percent-style escaping of `|` at the `EncryptedFs` layer only — works but
+     reintroduces an encoding scheme inside the crypto module, which §5 wants to
+     keep out.
+  Whichever path wins is the maintainer's call (§11 Q5); the milestone must not
+  pretend the problem is mount-layer-local, because it is not.
+- **Windows reserved device names** — `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+  `LPT1`–`LPT9` are rejected by Win32 (case-insensitive; trailing dots/spaces ignored).
+  Analysis against the actual code: a *name-collision* with these is unreachable,
+  because `encrypt` output always carries the ring AEAD nonce + tag overhead (≥27
+  bytes → ≥36 base64 chars), far past the 4-char shape of `COM1`. But a caller *on*
+  the mount can still try to create `NUL.txt`; that must fail with a precise status
+  (`STATUS_OBJECT_NAME_INVALID`-class), not a confusing "file not found", and this
+  deserves an explicit test so the driver's behaviour is specified, not emergent.
+- **Trailing dots/spaces** — worth stating explicitly because it is a *non*-hazard with
+  rencfs's alphabet: the on-disk charset is base64-standard plus `|` (after the `/`
+  rewrite), which contains no dot and no space, so trailing normalization cannot
+  silently corrupt existing entries. Any escape scheme introduced for the `|` problem
+  above must preserve that property (never emit a trailing `.`/space), and a round-trip
+  fuzz test over the full ciphertext-name alphabet should assert it.
+- **`.` / `..` handling.** rencfs already renames `.`/`..` to `$.`/`$..` on disk
+  (`hash_file_name`/`encrypt_file_name`); plaintext names literally starting with `$`
+  collide with that scheme on Linux today — a pre-existing quirk the Windows milestone
+  inherits, worth one sentence in the README rather than a silent surprise.
 - **`statfs`** — provide plausible defaults; no real block accounting.
-- **Timestamps** — support mtime/atime best-effort; NTFS `FileTime` precision is
-  higher than the Unix `SystemTime` the Linux backend uses; truncate gracefully.
+- **Timestamps / FILETIME epoch** — Windows timestamps are `FILETIME`: 100 ns ticks since
+  **1601-01-01**, not the Unix epoch. The offset between the two epochs is exactly
+  `11644473600` seconds (134774 days × 86400). rencfs stores Unix-epoch `SystemTime`
+  (via `SetFileAttr`/`FileAttr` on Linux), so every conversion in `windows.rs` must apply
+  this offset with 100 ns granularity and truncate gracefully (NTFS FILETIME precision is
+  higher than what the Linux backend has historically used). Getting the epoch wrong
+  shifts every displayed timestamp by ~369 years and *still looks plausible in Explorer*
+  until someone compares against Linux — so a **round-trip unit test** (unix epoch →
+  FILETIME → back, including the 1601/1970 boundaries and post-2038 dates) is mandatory,
+  not optional polish.
 
 Every "not supported" item above must be handled by returning a graceful error or a
 sensible default — **never a panic or silent wrong data** — so the first PR is honest.
@@ -308,7 +396,17 @@ A reviewer must be able to reproduce this exactly:
    - `mkdir C:\mnt\sub` and create a file inside it, then re-list.
    - Delete the file/dir, confirm the ciphertext disappears from `C:\data`.
 5. Unmount (Ctrl-C or `umount` equivalent) and confirm `C:\mnt` is released.
-6. **Negative test:** confirm that unsupported features (e.g. an ADS) do not crash the
+6. **Name-safety test:** from Linux, create a handful of files — because ciphertext
+   names are base64 (≈36+ chars at typical lengths), roughly half of them will contain
+   at least one `|` (the `/` rewrite); verify every such entry is listable and readable
+   through the chosen escape scheme on Windows, and that
+   trying to create `NUL.txt` / `COM1` on the mount fails with a precise name-invalid
+   status rather than "not found".
+7. **Timestamp test:** write a file, `set` its mtime to a known unix epoch value,
+   read it back through `dir /q` and through Linux after remount — the FILETIME
+   round-trip must be exact (§7); additionally run the unit round-trip test over the
+   1601/1970/2038 boundaries.
+8. **Negative test:** confirm that unsupported features (e.g. an ADS) do not crash the
    driver — they return a graceful error.
 
 If any step fails, the PR must say so explicitly rather than claiming success.
@@ -320,12 +418,20 @@ If any step fails, the PR must say so explicitly rather than claiming success.
 A PR that legitimately earns this bounty must:
 
 - [ ] Implement `src/mount/windows.rs` behind `#[cfg(target_os = "windows")]` and wire it
-      into `src/mount.rs` (no change to `EncryptedFs`).
+      into `src/mount.rs`. `EncryptedFs` itself stays backend-agnostic, **except** for
+      the ciphertext-name `|`/NTFS legality decision settled per §7 / §11 Q5 — that is
+      the one on-disk-format question the Windows milestone must answer, not a mount-layer detail.
 - [ ] Implement the `MountPoint` trait and return a real `MountHandle`.
 - [ ] Map the WinFsp callbacks to `EncryptedFs` methods per §5, with a path↔inode
       translation layer.
 - [ ] Handle the licensing checkpoint: document the GPL-3 boundary (or use `unifuse`/MIT)
       and add the WinFsp attribution notice.
+- [ ] Define the ciphertext-name alphabet decision for NTFS-hosted data dirs (§7):
+      rewrite target or base64url, with a cross-platform decode fallback, plus a
+      round-trip fuzz test over the full name alphabet.
+- [ ] Set `FSP_FSCTL_VOLUME_PARAMS.CaseSensitiveSearch` per the §7 decision and
+      document the consequence.
+- [ ] FILETIME↔unix round-trip unit test including 1601/1970/2038 boundary values.
 - [ ] Add the Windows-only dependency (feature-gated if the GPL boundary requires it).
 - [ ] Compile on `x86_64-pc-windows-msvc` (add a Windows CI job).
 - [ ] Pass the smoke test in §9 — read/write/list/create/delete round-trip on a real
@@ -342,10 +448,18 @@ A PR that legitimately earns this bounty must:
    the MIT `unifuse` path (nightly Rust + new abstraction)? This decides the crate choice.
 2. **CLI args:** confirm the exact mountpoint/data-dir argument order the Windows binary
    should accept (match `src/main.rs` / `src/run.rs`).
-3. **Case sensitivity:** should encrypted names be case-sensitive on Windows (to match
-   Linux) — I recommend yes.
+3. **Case sensitivity:** recommend yes — set
+   `FSP_FSCTL_VOLUME_PARAMS.CaseSensitiveSearch` so Windows does not fold two distinct
+   ciphertext names into one visible file (§7). Confirm the maintainer accepts the
+   installer-compat consequence.
 4. **CI:** is a Windows runner acceptable, and can a real mount be exercised there, or
    should the Windows integration test skip gracefully when no mount is possible?
+5. **Ciphertext-name alphabet (§7):** the `/`→`|` rewrite makes on-disk names illegal on
+   NTFS, which blocks Windows-hosted data dirs. Prefer (1) a rewrite-target change /
+   base64url with a legacy-decode fallback, (2) a target-aware dual-alphabet decoder,
+   or (3) an escape confined to the crypto layer? This is an on-disk-format decision —
+   it shapes whether a data dir can ever move between OSes — so it should not be
+   defaulted inside a Windows-only PR.
 
 ---
 
